@@ -12,13 +12,67 @@ const PORT = process.env.PORT || 3000;
 
 const config = { DATA_FILE: process.env.DATA_FILE || 'data.json' };
 
-// ===== OPTIMIZACIÓN 1: Compresión SOLO para contenido que lo necesita =====
+// ===== CATEGORÍAS =====
+const CATEGORIES = [
+    'Acción',
+    'Adaptaciones de libros',
+    'Anime',
+    'Astrología',
+    'Cine de intriga',
+    'Clásicas',
+    'Cortos',
+    'De Hollywood',
+    'Deportes',
+    'Documentales',
+    'Dramas',
+    'En Español',
+    'Estados de ánimo',
+    'Fantasía',
+    'Fe y espiritualidad',
+    'Independientes',
+    'Internacionales',
+    'Latinoamericanas',
+    'Los favoritos de la crítica',
+    'Música y musicales',
+    'Orgullo',
+    'Para reír',
+    'Para ver en familia',
+    'Pelis policiales',
+    'Romances',
+    'Sci-fi',
+    'Terror'
+];
+
+// ===== DETECCIÓN AUTOMÁTICA DE CATEGORÍAS =====
+const SPANISH_ARTICLES = /^(El |La |Los |Las |Un |Una |Del |De |Al )/i;
+const SPANISH_WORDS = /\b(del|los|las|una|con|por|para|pero|más|muy|también|donde|cuando|como|todo|esto|esta|este|está|son|han|fue|ser|hay|ver|que|sin|cada|así|desde|hasta|entre|sobre)\b/i;
+const ACCENTED_CHARS = /[áéíóúñüÁÉÍÓÚÑÜ]/;
+const LATIN_COUNTRIES = /\b(México|Mexico|Colombia|Argentina|Venezuela|Chile|Perú|Peru|Cuba|Bolivia|Paraguay|Uruguay|Ecuador|Costa Rica|Guatemala|Honduras|El Salvador|Nicaragua|Panamá|Panama|República Dominicana|Puerto Rico)\b/i;
+
+function detectCategories(seriesName) {
+    const cats = [];
+    const isSpanish = SPANISH_ARTICLES.test(seriesName) ||
+                      SPANISH_WORDS.test(seriesName) ||
+                      ACCENTED_CHARS.test(seriesName);
+    if (isSpanish) cats.push('En Español');
+    if (LATIN_COUNTRIES.test(seriesName)) cats.push('Latinoamericanas');
+    return cats;
+}
+
+// ===== CATEGORÍAS MANUALES (series-categories.json) =====
+function loadManualCategories() {
+    try {
+        const p = path.join(__dirname, 'series-categories.json');
+        if (!fs.existsSync(p)) return {};
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch { return {}; }
+}
+
 app.use(compression({
     filter: (req, res) => {
-        // NO comprimir streams de video/audio
         if (req.path === '/video-proxy') return false;
         if (req.headers.accept && (
-            req.headers.accept.includes('video') || 
+            req.headers.accept.includes('video') ||
             req.headers.accept.includes('audio')
         )) return false;
         return compression.filter(req, res);
@@ -41,10 +95,10 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-const videoProxyLimiter = rateLimit({ 
-    windowMs: 15 * 60 * 1000, 
-    max: 500, // Aumentado para streaming
-    skip: (req) => req.headers.range // No limitar requests de range
+const videoProxyLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 500,
+    skip: (req) => req.headers.range
 });
 
 let SERIES_LIST = [];
@@ -58,49 +112,90 @@ function loadData() {
         const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
         if (!Array.isArray(data)) return;
 
+        const manualCats = loadManualCategories();
         TOTAL_EPISODES = data.length;
         const map = {};
+
         data.forEach(item => {
             const name = item.series || 'Sin nombre';
             const season = String(item.season || '1');
-            if (!map[name]) map[name] = { name, poster: item["logo serie"] || '', seasons: {}, count: 0 };
+            if (!map[name]) {
+                const autoCats = detectCategories(name);
+                const manCats = manualCats[name] || [];
+                const merged = [...new Set([...autoCats, ...manCats])];
+                map[name] = {
+                    name,
+                    poster: item["logo serie"] || '',
+                    seasons: {},
+                    count: 0,
+                    categories: merged
+                };
+            }
             if (!map[name].seasons[season]) map[name].seasons[season] = [];
-            map[name].seasons[season].push({ ep: item.ep || 1, title: item.title || 'Episodio ' + (item.ep || 1), url: item.url || '' });
+            map[name].seasons[season].push({
+                ep: item.ep || 1,
+                title: item.title || 'Episodio ' + (item.ep || 1),
+                url: item.url || ''
+            });
             map[name].count++;
         });
 
-        Object.values(map).forEach(s => Object.keys(s.seasons).forEach(k => s.seasons[k].sort((a, b) => a.ep - b.ep)));
+        Object.values(map).forEach(s =>
+            Object.keys(s.seasons).forEach(k =>
+                s.seasons[k].sort((a, b) => a.ep - b.ep)
+            )
+        );
+
         SERIES_INDEX = map;
-        SERIES_LIST = Object.values(map).map(s => ({ name: s.name, poster: s.poster, seasons: Object.keys(s.seasons).length, count: s.count })).sort((a, b) => a.name.localeCompare(b.name));
+        SERIES_LIST = Object.values(map)
+            .map(s => ({
+                name: s.name,
+                poster: s.poster,
+                seasons: Object.keys(s.seasons).length,
+                count: s.count,
+                categories: s.categories
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name, 'es'));
+
         console.log('[OK] ' + SERIES_LIST.length + ' series, ' + TOTAL_EPISODES + ' episodios');
     } catch (e) { console.error('[ERROR]', e.message); }
 }
 
 loadData();
 
-// ===== OPTIMIZACIÓN 2: Headers CORS mejorados para streaming =====
-app.use((req, res, next) => { 
+app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Accept');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type');
-
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(204);
-    }
-    next(); 
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
 });
 
-app.get('/api/stats', (req, res) => res.json({ series: SERIES_LIST.length, episodes: TOTAL_EPISODES }));
+app.get('/api/stats', (req, res) =>
+    res.json({ series: SERIES_LIST.length, episodes: TOTAL_EPISODES })
+);
+
+// ===== NUEVO: Endpoint de categorías =====
+app.get('/api/categories', (req, res) =>
+    res.json({ data: CATEGORIES })
+);
 
 app.get('/api/series', (req, res) => {
     const page = parseInt(req.query.page) || 0;
     const limit = parseInt(req.query.limit) || 250;
     const search = (req.query.q || '').toLowerCase();
     const random = req.query.random === 'true';
+    const category = req.query.category || '';
+
     let list = [...SERIES_LIST];
     if (search) list = list.filter(s => s.name.toLowerCase().includes(search));
-    if (random) for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
+    // ===== NUEVO: filtrar por categoría =====
+    if (category) list = list.filter(s => s.categories.includes(category));
+    if (random) for (let i = list.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [list[i], list[j]] = [list[j], list[i]];
+    }
     const start = page * limit;
     res.json({ total: list.length, page, hasMore: start + limit < list.length, data: list.slice(start, start + limit) });
 });
@@ -111,7 +206,6 @@ app.get('/api/series/:name', (req, res) => {
     res.json({ data: series });
 });
 
-// ===== OPTIMIZACIÓN 3: Proxy de Video COMPLETAMENTE REESCRITO =====
 app.get('/video-proxy', videoProxyLimiter, (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: 'URL requerida' });
@@ -124,96 +218,58 @@ app.get('/video-proxy', videoProxyLimiter, (req, res) => {
     }
 
     const client = parsed.protocol === 'https:' ? https : http;
-
-    const opts = { 
-        hostname: parsed.hostname, 
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80), 
-        path: parsed.pathname + parsed.search, 
+    const opts = {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
         method: 'GET',
-        timeout: 30000, // 30 segundos timeout
-        headers: { 
+        timeout: 30000,
+        headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'identity', // Sin compresión para video
+            'Accept-Encoding': 'identity',
             'Connection': 'keep-alive',
             'Referer': parsed.origin + '/'
-        } 
+        }
     };
 
-    // ===== CRÍTICO: Pasar Range header para streaming =====
-    if (req.headers.range) {
-        opts.headers['Range'] = req.headers.range;
-    }
+    if (req.headers.range) opts.headers['Range'] = req.headers.range;
 
     const proxyReq = client.request(opts, proxyRes => {
-        // Manejar redirects
         if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-            // Limpiar listeners para evitar memory leak
             proxyRes.destroy();
             return res.redirect('/video-proxy?url=' + encodeURIComponent(proxyRes.headers.location));
         }
-
-        // Headers de respuesta optimizados para streaming
         const headers = {
             'Content-Type': proxyRes.headers['content-type'] || 'video/mp4',
             'Accept-Ranges': 'bytes',
             'Cache-Control': 'public, max-age=3600',
             'X-Content-Type-Options': 'nosniff'
         };
-
-        // Headers críticos para Range requests
-        if (proxyRes.headers['content-length']) {
-            headers['Content-Length'] = proxyRes.headers['content-length'];
-        }
-        if (proxyRes.headers['content-range']) {
-            headers['Content-Range'] = proxyRes.headers['content-range'];
-        }
-
-        // Status code correcto (206 para partial content)
-        const statusCode = proxyRes.statusCode;
-        res.writeHead(statusCode, headers);
-
-        // ===== CRÍTICO: Streaming directo sin buffering completo =====
+        if (proxyRes.headers['content-length']) headers['Content-Length'] = proxyRes.headers['content-length'];
+        if (proxyRes.headers['content-range']) headers['Content-Range'] = proxyRes.headers['content-range'];
+        res.writeHead(proxyRes.statusCode, headers);
         proxyRes.pipe(res, { end: true });
-
-        // Manejo de errores en el stream
         proxyRes.on('error', (err) => {
             console.error('[PROXY STREAM ERROR]', err.message);
-            if (!res.headersSent) {
-                res.status(502).json({ error: 'Stream error' });
-            } else {
-                res.end();
-            }
+            if (!res.headersSent) res.status(502).json({ error: 'Stream error' });
+            else res.end();
         });
     });
 
-    // Timeout
     proxyReq.on('timeout', () => {
-        console.error('[PROXY TIMEOUT]');
         proxyReq.destroy();
-        if (!res.headersSent) {
-            res.status(504).json({ error: 'Timeout' });
-        }
+        if (!res.headersSent) res.status(504).json({ error: 'Timeout' });
     });
-
-    // Error de conexión
     proxyReq.on('error', (err) => {
         console.error('[PROXY ERROR]', err.message);
-        if (!res.headersSent) {
-            res.status(502).json({ error: 'Connection error' });
-        }
+        if (!res.headersSent) res.status(502).json({ error: 'Connection error' });
     });
-
-    // Cuando el cliente cierra la conexión
-    req.on('close', () => {
-        proxyReq.destroy();
-    });
-
+    req.on('close', () => proxyReq.destroy());
     proxyReq.end();
 });
 
-// ===== OPTIMIZACIÓN 4: HTML con Player Mejorado =====
 const HTML = `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -226,13 +282,21 @@ const HTML = `<!DOCTYPE html>
 html,body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,sans-serif;height:100%;overflow:hidden}
 #app{height:100%;display:flex;flex-direction:column}
 
-.hdr{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--surface);border-bottom:1px solid var(--border)}
-.logo{color:var(--accent);font-weight:700;font-size:20px;letter-spacing:-1px}
-.srch{flex:1;background:var(--bg);border:2px solid var(--border);color:var(--text);padding:10px 16px;border-radius:8px;font-size:14px;outline:none}
+.hdr{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
+.logo{color:var(--accent);font-weight:700;font-size:20px;letter-spacing:-1px;white-space:nowrap}
+.srch{flex:1;background:var(--bg);border:2px solid var(--border);color:var(--text);padding:10px 16px;border-radius:8px;font-size:14px;outline:none;min-width:0}
 .srch:focus,.srch.f{border-color:var(--focus)}
-.btn{background:var(--card);border:2px solid var(--border);color:var(--text);padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer}
+.btn{background:var(--card);border:2px solid var(--border);color:var(--text);padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn.f{border-color:var(--focus)}
-.stats{color:var(--text2);font-size:12px}
+.stats{color:var(--text2);font-size:12px;white-space:nowrap}
+
+/* ===== BARRA DE CATEGORÍAS ===== */
+.cats-bar{display:flex;align-items:center;gap:6px;padding:10px 16px;background:var(--surface);border-bottom:1px solid var(--border);overflow-x:auto;flex-shrink:0;scrollbar-width:none}
+.cats-bar::-webkit-scrollbar{display:none}
+.cat-btn{padding:7px 16px;background:var(--bg);border:2px solid var(--border);border-radius:20px;color:var(--text2);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .15s}
+.cat-btn:hover{border-color:#555;color:var(--text)}
+.cat-btn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.cat-btn.f{border-color:var(--focus)}
 
 .main{flex:1;overflow-y:auto;padding:12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
@@ -254,7 +318,8 @@ html,body{background:var(--bg);color:var(--text);font-family:-apple-system,syste
 .back.f{border-color:var(--focus)}
 .panel-title{flex:1;font-size:18px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-.tabs{display:flex;gap:8px;padding:12px 16px;background:var(--surface);border-bottom:1px solid var(--border);overflow-x:auto}
+.tabs{display:flex;gap:8px;padding:12px 16px;background:var(--surface);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
 .tab{padding:8px 18px;background:var(--bg);border:2px solid var(--border);border-radius:6px;color:var(--text2);font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap}
 .tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
 .tab.f{border-color:var(--focus)}
@@ -341,13 +406,19 @@ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
         <button class="btn" id="mix">Aleatorio</button>
         <span class="stats" id="stats"></span>
     </div>
+
+    <!-- ===== BARRA DE CATEGORÍAS ===== -->
+    <div class="cats-bar" id="cats-bar">
+        <button class="cat-btn on" data-cat="">Todas</button>
+    </div>
+
     <div class="main" id="main">
         <div class="grid" id="grid"><div class="msg load">Cargando</div></div>
     </div>
 
     <div class="panel" id="detail">
         <div class="panel-hdr">
-            <button class="back" id="det-back">◀</button>
+            <button class="back" id="det-back">&#9664;</button>
             <div class="panel-title" id="det-title"></div>
         </div>
         <div class="tabs" id="tabs"></div>
@@ -423,55 +494,67 @@ const state = {
     playing: false,
     lastFocused: { home: null, detail: null },
     retryCount: 0,
-    maxRetries: 3
+    maxRetries: 3,
+    category: ''   // ← categoría activa
 };
 
 let hideT, volT, indT, nextT, bufferCheckT;
 
 const el = {
     grid: $('grid'), main: $('main'), srch: $('srch'), mix: $('mix'), stats: $('stats'),
+    catsBar: $('cats-bar'),
     detail: $('detail'), detBack: $('det-back'), detTitle: $('det-title'), tabs: $('tabs'), eps: $('eps'),
     player: $('player'), vid: $('vid'), pUi: $('p-ui'), pTitle: $('p-title'), pStatus: $('p-status'),
-    pLoad: $('p-load'), pLoadTxt: $('p-load-txt'), pErr: $('p-err'), pErrSub: $('p-err-sub'), pRetry: $('p-retry'), pBack: $('p-back'),
+    pLoad: $('p-load'), pLoadTxt: $('p-load-txt'), pErr: $('p-err'), pErrSub: $('p-err-sub'),
+    pRetry: $('p-retry'), pBack: $('p-back'),
     pInd: $('p-ind'), pVol: $('p-vol'), pVolFill: $('p-vol-fill'), pVolPct: $('p-vol-pct'),
     pBar: $('p-bar'), pBarFill: $('p-bar-fill'), pBarBuf: $('p-bar-buf'), pBarDot: $('p-bar-dot'),
     pCur: $('p-cur'), pDur: $('p-dur'),
     pPrev: $('p-prev'), pRw: $('p-rw'), pPp: $('p-pp'), pFw: $('p-fw'), pNxt: $('p-nxt'),
-    pNext: $('p-next'), pNextT: $('p-next-t'), pNextCd: $('p-next-cd'), pNextPlay: $('p-next-play'), pNextCancel: $('p-next-cancel')
+    pNext: $('p-next'), pNextT: $('p-next-t'), pNextCd: $('p-next-cd'),
+    pNextPlay: $('p-next-play'), pNextCancel: $('p-next-cancel')
 };
 
 // ===== HISTORY API =====
 function initHistory() {
     history.replaceState({ view: 'home' }, '', '#home');
-    window.addEventListener('popstate', function(e) {
-        handleHistoryBack(e.state);
-    });
+    window.addEventListener('popstate', function(e) { handleHistoryBack(e.state); });
 }
-
-function pushView(view) {
-    history.pushState({ view: view }, '', '#' + view);
-}
-
+function pushView(view) { history.pushState({ view: view }, '', '#' + view); }
 function handleHistoryBack(historyState) {
-    if (!historyState) {
-        history.pushState({ view: 'home' }, '', '#home');
-        return;
-    }
+    if (!historyState) { history.pushState({ view: 'home' }, '', '#home'); return; }
+    if (state.view === 'player') { closePlayerInternal(); history.pushState({ view: 'detail' }, '', '#detail'); }
+    else if (state.view === 'detail') { closeDetailInternal(); history.pushState({ view: 'home' }, '', '#home'); }
+    else { history.pushState({ view: 'home' }, '', '#home'); }
+}
+initHistory();
 
-    if (state.view === 'player') {
-        closePlayerInternal();
-        history.pushState({ view: 'detail' }, '', '#detail');
-    } else if (state.view === 'detail') {
-        closeDetailInternal();
-        history.pushState({ view: 'home' }, '', '#home');
-    } else {
-        history.pushState({ view: 'home' }, '', '#home');
-    }
+// ===== CATEGORÍAS: cargar y renderizar barra =====
+function loadCategories() {
+    fetch('/api/categories').then(r => r.json()).then(d => {
+        const bar = el.catsBar;
+        bar.innerHTML = '<button class="cat-btn on" data-cat="">Todas</button>';
+        (d.data || []).forEach(cat => {
+            const b = document.createElement('button');
+            b.className = 'cat-btn';
+            b.dataset.cat = cat;
+            b.textContent = cat;
+            bar.appendChild(b);
+        });
+        bar.addEventListener('click', e => {
+            const btn = e.target.closest('.cat-btn');
+            if (!btn) return;
+            bar.querySelectorAll('.cat-btn').forEach(x => x.classList.remove('on'));
+            btn.classList.add('on');
+            state.category = btn.dataset.cat || '';
+            load(false, false);
+        });
+    }).catch(() => {});
 }
 
 // Init
-initHistory();
 fetch('/api/stats').then(r => r.json()).then(d => { el.stats.textContent = d.series + ' series'; }).catch(() => {});
+loadCategories();
 load(false, true);
 calcCols();
 window.addEventListener('resize', calcCols);
@@ -491,25 +574,12 @@ function calcCols() {
 function onKey(e) {
     const k = e.key;
     const navKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', ' '];
-
-    if (navKeys.includes(k)) {
-        e.preventDefault();
-        e.stopPropagation();
-    }
-
-    if (state.view === 'player') {
-        playerKey(k);
-        return;
-    }
-
+    if (navKeys.includes(k)) { e.preventDefault(); e.stopPropagation(); }
+    if (state.view === 'player') { playerKey(k); return; }
     if (document.activeElement === el.srch) {
-        if (k === 'ArrowDown') {
-            el.srch.blur();
-            focusFirst();
-        }
+        if (k === 'ArrowDown') { el.srch.blur(); focusFirst(); }
         return;
     }
-
     switch (k) {
         case 'ArrowUp': move('up'); break;
         case 'ArrowDown': move('down'); break;
@@ -520,39 +590,25 @@ function onKey(e) {
 }
 
 function getFocusable() {
-    if (state.view === 'home') return [...document.querySelectorAll('#srch,#mix,.card')].filter(e => e.offsetParent);
+    if (state.view === 'home') return [...document.querySelectorAll('#srch,#mix,.cat-btn,.card')].filter(e => e.offsetParent);
     if (state.view === 'detail') return [...document.querySelectorAll('#det-back,.tab,.ep')].filter(e => e.offsetParent);
     return [];
 }
-
 function focus(elem) {
     if (state.focused) state.focused.classList.remove('f');
     state.focused = elem;
-    if (elem) {
-        elem.classList.add('f');
-        elem.scrollIntoView({ block: 'nearest' });
-    }
+    if (elem) { elem.classList.add('f'); elem.scrollIntoView({ block: 'nearest' }); }
 }
-
 function focusFirst() {
     const f = getFocusable();
     if (state.view === 'home') {
-        if (state.lastFocused.home && f.includes(state.lastFocused.home)) {
-            focus(state.lastFocused.home);
-        } else {
-            const card = f.find(e => e.classList.contains('card'));
-            focus(card || f[0]);
-        }
+        if (state.lastFocused.home && f.includes(state.lastFocused.home)) { focus(state.lastFocused.home); }
+        else { const card = f.find(e => e.classList.contains('card')); focus(card || f[0]); }
     } else if (state.view === 'detail') {
-        if (state.lastFocused.detail && f.includes(state.lastFocused.detail)) {
-            focus(state.lastFocused.detail);
-        } else {
-            const ep = f.find(e => e.classList.contains('ep'));
-            focus(ep || f[0]);
-        }
+        if (state.lastFocused.detail && f.includes(state.lastFocused.detail)) { focus(state.lastFocused.detail); }
+        else { const ep = f.find(e => e.classList.contains('ep')); focus(ep || f[0]); }
     }
 }
-
 function saveFocus() {
     if (state.view === 'home') state.lastFocused.home = state.focused;
     else if (state.view === 'detail') state.lastFocused.detail = state.focused;
@@ -561,20 +617,12 @@ function saveFocus() {
 function move(dir) {
     const f = getFocusable(), i = f.indexOf(state.focused);
     if (i < 0) { focusFirst(); return; }
-
     if (state.view === 'home') {
         const cards = f.filter(e => e.classList.contains('card'));
         const ci = cards.indexOf(state.focused);
         if (ci >= 0) {
-            if (dir === 'up') {
-                if (ci < state.cols) focus(el.mix);
-                else focus(cards[ci - state.cols]);
-            }
-            if (dir === 'down') {
-                const ni = ci + state.cols;
-                if (ni < cards.length) focus(cards[ni]);
-                else if (state.hasMore) load(true, false);
-            }
+            if (dir === 'up') { if (ci < state.cols) focus(el.mix); else focus(cards[ci - state.cols]); }
+            if (dir === 'down') { const ni = ci + state.cols; if (ni < cards.length) focus(cards[ni]); else if (state.hasMore) load(true, false); }
             if (dir === 'left' && ci > 0) focus(cards[ci - 1]);
             if (dir === 'right' && ci < cards.length - 1) focus(cards[ci + 1]);
         } else {
@@ -583,41 +631,31 @@ function move(dir) {
             if (dir === 'down' && cards.length) focus(cards[0]);
         }
     }
-
     if (state.view === 'detail') {
         const tabs = f.filter(e => e.classList.contains('tab'));
         const eps = f.filter(e => e.classList.contains('ep'));
         const ti = tabs.indexOf(state.focused);
         const ei = eps.indexOf(state.focused);
-
         if (state.focused === el.detBack) {
             if (dir === 'down' && tabs.length) focus(tabs[0]);
             if (dir === 'right' && tabs.length) focus(tabs[0]);
         } else if (ti >= 0) {
             if (dir === 'up') focus(el.detBack);
             if (dir === 'down' && eps.length) focus(eps[0]);
-            if (dir === 'left') {
-                if (ti > 0) focus(tabs[ti - 1]);
-                else focus(el.detBack);
-            }
+            if (dir === 'left') { if (ti > 0) focus(tabs[ti - 1]); else focus(el.detBack); }
             if (dir === 'right' && ti < tabs.length - 1) focus(tabs[ti + 1]);
         } else if (ei >= 0) {
-            if (dir === 'up') {
-                if (ei > 0) focus(eps[ei - 1]);
-                else if (tabs.length) focus(tabs[0]);
-            }
+            if (dir === 'up') { if (ei > 0) focus(eps[ei - 1]); else if (tabs.length) focus(tabs[0]); }
             if (dir === 'down' && ei < eps.length - 1) focus(eps[ei + 1]);
         }
     }
 }
-
 function activate() {
     if (!state.focused) return;
     if (state.focused === el.srch) { el.srch.focus(); return; }
     state.focused.click();
 }
 
-// ===== PLAYER OPTIMIZADO =====
 function playerKey(k) {
     showUI();
     switch (k) {
@@ -628,23 +666,14 @@ function playerKey(k) {
         case 'Enter': case ' ': togglePlay(); break;
     }
 }
-
 function togglePlay() {
-    if (el.vid.paused) { 
-        el.vid.play().catch(handlePlayError); 
-        showInd('▶'); 
-    } else { 
-        el.vid.pause(); 
-        showInd('⏸'); 
-    }
+    if (el.vid.paused) { el.vid.play().catch(handlePlayError); showInd('&#9654;'); }
+    else { el.vid.pause(); showInd('&#9646;&#9646;'); }
 }
-
 function seek(s) {
-    const newTime = Math.max(0, Math.min(el.vid.currentTime + s, el.vid.duration || 0));
-    el.vid.currentTime = newTime;
+    el.vid.currentTime = Math.max(0, Math.min(el.vid.currentTime + s, el.vid.duration || 0));
     showInd((s > 0 ? '+' : '') + s + 's');
 }
-
 function vol(d) {
     el.vid.volume = Math.max(0, Math.min(1, el.vid.volume + d));
     updateVol();
@@ -652,20 +681,17 @@ function vol(d) {
     clearTimeout(volT);
     volT = setTimeout(() => el.pVol.classList.remove('show'), 1500);
 }
-
 function updateVol() {
     const v = Math.round(el.vid.volume * 100);
     el.pVolFill.style.height = v + '%';
     el.pVolPct.textContent = v + '%';
 }
-
 function showInd(txt) {
-    el.pInd.textContent = txt;
+    el.pInd.innerHTML = txt;
     el.pInd.classList.add('show');
     clearTimeout(indT);
     indT = setTimeout(() => el.pInd.classList.remove('show'), 500);
 }
-
 function showUI() {
     el.pUi.classList.remove('hide');
     clearTimeout(hideT);
@@ -674,93 +700,26 @@ function showUI() {
     }, 3000);
 }
 
-// ===== OPTIMIZACIÓN 5: Manejo mejorado de eventos de video =====
 function setupPlayer() {
     const v = el.vid;
-
-    // Configuración óptima del video
     v.preload = 'auto';
     v.playsInline = true;
-
-    v.addEventListener('loadstart', () => { 
-        el.pLoad.classList.add('show'); 
-        el.pErr.classList.remove('show'); 
-        el.pLoadTxt.textContent = 'Conectando...';
-        updateStatus('Conectando...');
-    });
-
-    v.addEventListener('loadedmetadata', () => {
-        el.pLoadTxt.textContent = 'Cargando video...';
-        updateStatus('Preparando...');
-    });
-
-    v.addEventListener('loadeddata', () => {
-        el.pLoadTxt.textContent = 'Casi listo...';
-    });
-
-    v.addEventListener('canplay', () => {
-        el.pLoad.classList.remove('show');
-        updateStatus('');
-        state.retryCount = 0; // Reset retry count on success
-    });
-
-    v.addEventListener('canplaythrough', () => {
-        el.pLoad.classList.remove('show');
-        updateStatus('');
-    });
-
-    v.addEventListener('waiting', () => { 
-        el.pLoad.classList.add('show');
-        el.pLoadTxt.textContent = 'Buffering...';
-        updateStatus('Buffering...');
-    });
-
-    v.addEventListener('playing', () => { 
-        el.pLoad.classList.remove('show'); 
-        state.playing = true; 
-        el.pPp.textContent = 'PAUSE'; 
-        hideNext();
-        updateStatus('');
-        startBufferMonitor();
-    });
-
-    v.addEventListener('pause', () => { 
-        state.playing = false; 
-        el.pPp.textContent = 'PLAY';
-        stopBufferMonitor();
-    });
-
-    v.addEventListener('timeupdate', () => { 
-        updateProg(); 
-        checkNext(); 
-    });
-
+    v.addEventListener('loadstart', () => { el.pLoad.classList.add('show'); el.pErr.classList.remove('show'); el.pLoadTxt.textContent = 'Conectando...'; updateStatus('Conectando...'); });
+    v.addEventListener('loadedmetadata', () => { el.pLoadTxt.textContent = 'Cargando video...'; updateStatus('Preparando...'); });
+    v.addEventListener('loadeddata', () => { el.pLoadTxt.textContent = 'Casi listo...'; });
+    v.addEventListener('canplay', () => { el.pLoad.classList.remove('show'); updateStatus(''); state.retryCount = 0; });
+    v.addEventListener('canplaythrough', () => { el.pLoad.classList.remove('show'); updateStatus(''); });
+    v.addEventListener('waiting', () => { el.pLoad.classList.add('show'); el.pLoadTxt.textContent = 'Buffering...'; updateStatus('Buffering...'); });
+    v.addEventListener('playing', () => { el.pLoad.classList.remove('show'); state.playing = true; el.pPp.textContent = 'PAUSE'; hideNext(); updateStatus(''); startBufferMonitor(); });
+    v.addEventListener('pause', () => { state.playing = false; el.pPp.textContent = 'PLAY'; stopBufferMonitor(); });
+    v.addEventListener('timeupdate', () => { updateProg(); checkNext(); });
     v.addEventListener('progress', updateBuf);
-
-    v.addEventListener('durationchange', () => { 
-        el.pDur.textContent = fmt(v.duration); 
-    });
-
+    v.addEventListener('durationchange', () => { el.pDur.textContent = fmt(v.duration); });
     v.addEventListener('volumechange', updateVol);
-
-    v.addEventListener('ended', () => {
-        stopBufferMonitor();
-        showNext();
-    });
-
-    // ===== OPTIMIZACIÓN 6: Manejo mejorado de errores =====
+    v.addEventListener('ended', () => { stopBufferMonitor(); showNext(); });
     v.addEventListener('error', handleVideoError);
-
-    v.addEventListener('stalled', () => {
-        console.log('Stream stalled, checking connection...');
-        updateStatus('Reconectando...');
-        el.pLoadTxt.textContent = 'Reconectando...';
-    });
-
-    v.addEventListener('suspend', () => {
-        console.log('Download suspended');
-    });
-
+    v.addEventListener('stalled', () => { updateStatus('Reconectando...'); el.pLoadTxt.textContent = 'Reconectando...'; });
+    v.addEventListener('suspend', () => {});
     el.pPp.onclick = togglePlay;
     el.pRw.onclick = () => seek(-10);
     el.pFw.onclick = () => seek(10);
@@ -781,7 +740,6 @@ function handleVideoError(e) {
     console.error('Video error:', e);
     const error = el.vid.error;
     let msg = 'Error desconocido';
-
     if (error) {
         switch(error.code) {
             case 1: msg = 'Carga abortada'; break;
@@ -790,96 +748,59 @@ function handleVideoError(e) {
             case 4: msg = 'Formato no soportado'; break;
         }
     }
-
     el.pErrSub.textContent = msg;
-
-    // Auto-retry para errores de red
     if (error && error.code === 2 && state.retryCount < state.maxRetries) {
         state.retryCount++;
         el.pLoadTxt.textContent = 'Reintentando... (' + state.retryCount + '/' + state.maxRetries + ')';
         updateStatus('Reintentando...');
         setTimeout(retry, 2000);
     } else {
-        el.pLoad.classList.remove('show'); 
+        el.pLoad.classList.remove('show');
         el.pErr.classList.add('show');
         stopBufferMonitor();
     }
 }
-
 function handlePlayError(e) {
     console.error('Play error:', e);
-    if (e.name === 'NotAllowedError') {
-        // Autoplay blocked, show play button
-        el.pPp.textContent = 'PLAY';
-    }
+    if (e.name === 'NotAllowedError') el.pPp.textContent = 'PLAY';
 }
-
-function updateStatus(text) {
-    el.pStatus.textContent = text;
-}
-
-// ===== OPTIMIZACIÓN 7: Monitor de buffer =====
+function updateStatus(text) { el.pStatus.textContent = text; }
 function startBufferMonitor() {
     stopBufferMonitor();
     bufferCheckT = setInterval(() => {
         if (el.vid.buffered.length > 0) {
-            const buffered = el.vid.buffered.end(el.vid.buffered.length - 1);
-            const current = el.vid.currentTime;
-            const bufferAhead = buffered - current;
-
-            if (bufferAhead < 2 && !el.vid.paused) {
-                updateStatus('Buffer bajo...');
-            } else if (bufferAhead > 5) {
-                updateStatus('');
-            }
+            const bufferAhead = el.vid.buffered.end(el.vid.buffered.length - 1) - el.vid.currentTime;
+            if (bufferAhead < 2 && !el.vid.paused) updateStatus('Buffer bajo...');
+            else if (bufferAhead > 5) updateStatus('');
         }
     }, 1000);
 }
-
-function stopBufferMonitor() {
-    if (bufferCheckT) {
-        clearInterval(bufferCheckT);
-        bufferCheckT = null;
-    }
-}
-
+function stopBufferMonitor() { if (bufferCheckT) { clearInterval(bufferCheckT); bufferCheckT = null; } }
 function updateProg() {
     const p = el.vid.duration ? (el.vid.currentTime / el.vid.duration) * 100 : 0;
     el.pBarFill.style.width = p + '%';
     el.pBarDot.style.left = p + '%';
     el.pCur.textContent = fmt(el.vid.currentTime);
 }
-
 function updateBuf() {
     if (el.vid.buffered.length) {
         const p = (el.vid.buffered.end(el.vid.buffered.length - 1) / el.vid.duration) * 100;
         el.pBarBuf.style.width = p + '%';
     }
 }
-
 function retry() {
     el.pErr.classList.remove('show');
     el.pLoad.classList.add('show');
     el.pLoadTxt.textContent = 'Reintentando...';
-
     const currentTime = el.vid.currentTime;
     const src = el.vid.src;
-
     el.vid.src = '';
-
-    // Pequeño delay antes de reintentar
-    setTimeout(() => {
-        el.vid.src = src;
-        el.vid.currentTime = currentTime;
-        el.vid.play().catch(handlePlayError);
-    }, 500);
+    setTimeout(() => { el.vid.src = src; el.vid.currentTime = currentTime; el.vid.play().catch(handlePlayError); }, 500);
 }
-
 function checkNext() {
     const rem = (el.vid.duration || 0) - el.vid.currentTime;
     if (rem <= 15 && rem > 0 && hasNext() && !nextT) showNext();
 }
-
 function showNext() {
     if (!hasNext()) return;
     const n = getNext();
@@ -887,13 +808,9 @@ function showNext() {
     el.pNext.classList.add('show');
     let c = 8;
     el.pNextCd.textContent = 'En ' + c + 's';
-    nextT = setInterval(() => {
-        c--; el.pNextCd.textContent = 'En ' + c + 's';
-        if (c <= 0) { clearInterval(nextT); nextT = null; nextEp(); }
-    }, 1000);
+    nextT = setInterval(() => { c--; el.pNextCd.textContent = 'En ' + c + 's'; if (c <= 0) { clearInterval(nextT); nextT = null; nextEp(); } }, 1000);
     showUI();
 }
-
 function hideNext() { el.pNext.classList.remove('show'); if (nextT) { clearInterval(nextT); nextT = null; } }
 function cancelNext() { hideNext(); }
 function hasNext() { return state.series && state.epIdx < state.series.seasons[state.season].length - 1; }
@@ -901,45 +818,25 @@ function getNext() { return state.series.seasons[state.season][state.epIdx + 1];
 function nextEp() { hideNext(); if (hasNext()) { state.epIdx++; playEp(state.series.seasons[state.season][state.epIdx]); } }
 function prevEp() { if (state.epIdx > 0) { state.epIdx--; playEp(state.series.seasons[state.season][state.epIdx]); } }
 
-// ===== OPTIMIZACIÓN 8: Función de reproducción mejorada =====
 function playEp(ep) {
     state.retryCount = 0;
     hideNext();
     el.pErr.classList.remove('show');
     el.pLoad.classList.add('show');
     el.pLoadTxt.textContent = 'Conectando...';
-
     let u = ep.url;
-    // Usar proxy para URLs HTTP o si hay problemas de CORS
     if (u.startsWith('http://') || shouldUseProxy(u)) {
         u = '/video-proxy?url=' + encodeURIComponent(u);
     }
-
-    // Limpiar video anterior
     el.vid.pause();
     el.vid.removeAttribute('src');
     el.vid.load();
-
-    // Pequeño delay para asegurar limpieza
-    setTimeout(() => {
-        el.vid.src = u;
-        el.pTitle.textContent = ep.title;
-        el.vid.play().catch(handlePlayError);
-        showUI();
-    }, 100);
+    setTimeout(() => { el.vid.src = u; el.pTitle.textContent = ep.title; el.vid.play().catch(handlePlayError); showUI(); }, 100);
 }
-
 function shouldUseProxy(url) {
-    // Lista de dominios que necesitan proxy
-    const proxyDomains = ['example.com']; // Añadir dominios problemáticos
-    try {
-        const parsed = new URL(url);
-        return proxyDomains.some(d => parsed.hostname.includes(d));
-    } catch {
-        return false;
-    }
+    const proxyDomains = ['example.com'];
+    try { const parsed = new URL(url); return proxyDomains.some(d => parsed.hostname.includes(d)); } catch { return false; }
 }
-
 function fmt(s) {
     if (!s || isNaN(s)) return '0:00';
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = Math.floor(s % 60);
@@ -955,6 +852,8 @@ function load(append, random) {
     let u = '/api/series?page=' + state.page + '&limit=250';
     if (el.srch.value.trim()) u += '&q=' + encodeURIComponent(el.srch.value.trim());
     if (random) u += '&random=true';
+    // ← categoría activa
+    if (state.category) u += '&category=' + encodeURIComponent(state.category);
 
     fetch(u).then(r => r.json()).then(d => {
         if (!append) el.grid.innerHTML = '';
@@ -998,7 +897,6 @@ function openDetail(name) {
     el.detail.classList.add('open');
     el.tabs.innerHTML = '<div class="msg load"></div>';
     el.eps.innerHTML = '';
-
     fetch('/api/series/' + encodeURIComponent(name)).then(r => r.json()).then(res => {
         state.series = res.data;
         const ks = Object.keys(state.series.seasons).sort((a, b) => a - b);
@@ -1008,7 +906,6 @@ function openDetail(name) {
         setTimeout(focusFirst, 50);
     }).catch(() => el.tabs.innerHTML = '<div class="msg">Error</div>');
 }
-
 function renderTabs(ks) {
     el.tabs.innerHTML = '';
     ks.forEach(k => {
@@ -1023,7 +920,6 @@ function renderTabs(ks) {
         el.tabs.appendChild(t);
     });
 }
-
 function renderEps() {
     const eps = state.series?.seasons[state.season];
     if (!eps?.length) { el.eps.innerHTML = '<div class="msg">Sin episodios</div>'; return; }
@@ -1036,7 +932,6 @@ function renderEps() {
         el.eps.appendChild(d);
     });
 }
-
 function closeDetailInternal() {
     el.detail.classList.remove('open');
     state.view = 'home';
@@ -1044,20 +939,10 @@ function closeDetailInternal() {
     state.lastFocused.detail = null;
     setTimeout(focusFirst, 50);
 }
-
-function closeDetail() {
-    history.back();
-}
+function closeDetail() { history.back(); }
 
 // ===== PLAYER =====
-function openPlayer(ep) {
-    saveFocus();
-    state.view = 'player';
-    pushView('player');
-    playEp(ep);
-    el.player.classList.add('open');
-}
-
+function openPlayer(ep) { saveFocus(); state.view = 'player'; pushView('player'); playEp(ep); el.player.classList.add('open'); }
 function closePlayerInternal() {
     el.vid.pause();
     el.vid.removeAttribute('src');
@@ -1069,16 +954,20 @@ function closePlayerInternal() {
     setTimeout(focusFirst, 50);
 }
 
-function closePlayer() {
-    history.back();
-}
-
 // ===== MOUSE =====
 function setupMouse() {
     el.detBack.onclick = closeDetail;
     el.mix.onclick = () => load(false, true);
     let t;
-    el.srch.oninput = () => { clearTimeout(t); t = setTimeout(() => load(false, !el.srch.value.trim()), 300); };
+    el.srch.oninput = () => {
+        clearTimeout(t);
+        t = setTimeout(() => {
+            // Al buscar, resetear categoría
+            state.category = '';
+            el.catsBar.querySelectorAll('.cat-btn').forEach(x => x.classList.toggle('on', x.dataset.cat === ''));
+            load(false, !el.srch.value.trim());
+        }, 300);
+    };
     el.main.onscroll = () => {
         if (!state.loading && state.hasMore) {
             const { scrollTop, scrollHeight, clientHeight } = el.main;
